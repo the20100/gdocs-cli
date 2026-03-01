@@ -91,9 +91,37 @@ func printInfo() {
 	fmt.Printf("  GDOCS_CLIENT_ID    = %s\n", maskOrEmpty(os.Getenv("GDOCS_CLIENT_ID")))
 }
 
+func maskOrEmpty(v string) string {
+	if v == "" {
+		return "(not set)"
+	}
+	if len(v) <= 8 {
+		return "***"
+	}
+	return v[:4] + "..." + v[len(v)-4:]
+}
+
+// resolveEnv returns the value of the first non-empty environment variable from the given names.
+func resolveEnv(names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // resolveToken returns an OAuth access token from env var or stored config.
 func resolveToken() (string, error) {
-	if t := os.Getenv("GDOCS_ACCESS_TOKEN"); t != "" {
+	if t := resolveEnv(
+		"GDOCS_ACCESS_TOKEN",
+		"GDOCS_TOKEN",
+		"GOOGLE_DOCS_TOKEN",
+		"GDOCS_BEARER_TOKEN",
+		"GOOGLE_DOCS_ACCESS_TOKEN",
+		"GDOCS_ACCESS",
+		"TOKEN_GDOCS",
+	); t != "" {
 		return t, nil
 	}
 	var err error
