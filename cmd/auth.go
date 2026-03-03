@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -71,6 +72,8 @@ You can also set the GDOCS_ACCESS_TOKEN env var instead of using this command.`,
 	},
 }
 
+var authLoginNoBrowser bool
+
 var authLoginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Log in to Google via browser OAuth (persistent token)",
@@ -84,10 +87,18 @@ Steps to set up OAuth credentials:
   2. Create a project and enable the Google Docs API
   3. Go to APIs & Services > Credentials > Create Credentials > OAuth client ID
   4. Choose "Desktop app" as the application type
-  5. Download the JSON and export the values:
+  5. Add http://localhost:8080 as an authorized redirect URI
+  6. Download the JSON and export the values:
        export GDOCS_CLIENT_ID=your_client_id
        export GDOCS_CLIENT_SECRET=your_client_secret
-  6. Run: gdocs auth login`,
+  7. Run: gdocs auth login
+
+On a remote server (VPS) where no browser is available:
+  gdocs auth login --no-browser
+
+  This prints the auth URL for you to open locally. After authorizing, your
+  browser will redirect to localhost:8080 (which will fail to load — that's ok).
+  Copy the full URL from the address bar and paste it into the terminal.`,
 	RunE: runAuthLogin,
 }
 
@@ -131,6 +142,7 @@ var authLogoutCmd = &cobra.Command{
 }
 
 func init() {
+	authLoginCmd.Flags().BoolVar(&authLoginNoBrowser, "no-browser", false, "Manual auth flow for remote/VPS: print the URL, prompt for the redirect URL")
 	authCmd.AddCommand(authSetTokenCmd, authLoginCmd, authStatusCmd, authLogoutCmd)
 	rootCmd.AddCommand(authCmd)
 }
@@ -146,66 +158,78 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("GDOCS_CLIENT_SECRET not set — see: gdocs auth login --help")
 	}
 
-	// Start a local HTTP server to receive the OAuth callback
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("finding free port: %w", err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	var code string
+	var redirectURI string
 
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
+	if authLoginNoBrowser {
+		redirectURI = "http://localhost:8080"
+		authURL := buildGoogleAuthURL(clientID, redirectURI)
+		var err error
+		code, err = runOAuthFlowManual(authURL)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Start a local HTTP server to receive the OAuth callback
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("finding free port: %w", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		redirectURI = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if errMsg := q.Get("error"); errMsg != "" {
-			errCh <- fmt.Errorf("OAuth error: %s — %s", errMsg, q.Get("error_description"))
-			http.Error(w, "Authentication failed. You may close this tab.", http.StatusBadRequest)
-			return
-		}
-		code := q.Get("code")
-		if code == "" {
-			errCh <- fmt.Errorf("no code returned in callback")
-			http.Error(w, "No code received. You may close this tab.", http.StatusBadRequest)
-			return
-		}
-		codeCh <- code
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">
+		codeCh := make(chan string, 1)
+		errCh := make(chan error, 1)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			if errMsg := q.Get("error"); errMsg != "" {
+				errCh <- fmt.Errorf("OAuth error: %s — %s", errMsg, q.Get("error_description"))
+				http.Error(w, "Authentication failed. You may close this tab.", http.StatusBadRequest)
+				return
+			}
+			code := q.Get("code")
+			if code == "" {
+				errCh <- fmt.Errorf("no code returned in callback")
+				http.Error(w, "No code received. You may close this tab.", http.StatusBadRequest)
+				return
+			}
+			codeCh <- code
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">
 <h2>Authentication successful!</h2>
 <p>You may close this tab and return to the terminal.</p>
 </body></html>`)
-	})
+		})
 
-	srv := &http.Server{Handler: mux}
-	go func() {
-		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
-			select {
-			case errCh <- fmt.Errorf("callback server error: %w", err):
-			default:
+		srv := &http.Server{Handler: mux}
+		go func() {
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				select {
+				case errCh <- fmt.Errorf("callback server error: %w", err):
+				default:
+				}
 			}
+		}()
+
+		authURL := buildGoogleAuthURL(clientID, redirectURI)
+		fmt.Println("\nOpening browser for Google authentication...")
+		fmt.Printf("If the browser does not open automatically, visit:\n  %s\n\n", authURL)
+		openBrowser(authURL)
+		fmt.Printf("Waiting for callback on http://127.0.0.1:%d/callback ...\n", port)
+
+		select {
+		case code = <-codeCh:
+		case err = <-errCh:
+			shutdownServer(srv)
+			return err
+		case <-time.After(5 * time.Minute):
+			shutdownServer(srv)
+			return fmt.Errorf("timed out waiting for OAuth callback (5 minutes)")
 		}
-	}()
-
-	authURL := buildGoogleAuthURL(clientID, redirectURI)
-	fmt.Println("\nOpening browser for Google authentication...")
-	fmt.Printf("If the browser does not open automatically, visit:\n  %s\n\n", authURL)
-	openBrowser(authURL)
-	fmt.Printf("Waiting for callback on http://127.0.0.1:%d/callback ...\n", port)
-
-	var code string
-	select {
-	case code = <-codeCh:
-	case err := <-errCh:
 		shutdownServer(srv)
-		return err
-	case <-time.After(5 * time.Minute):
-		shutdownServer(srv)
-		return fmt.Errorf("timed out waiting for OAuth callback (5 minutes)")
 	}
-	shutdownServer(srv)
 
 	fmt.Println("Exchanging authorization code for token...")
 	token, err := exchangeGoogleCode(code, clientID, clientSecret, redirectURI)
@@ -220,6 +244,37 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\nAccess token saved to %s\n", config.Path())
 	fmt.Printf("Token: %s\n", maskOrEmpty(token))
 	return nil
+}
+
+func runOAuthFlowManual(authURL string) (string, error) {
+	fmt.Printf("\nOpen the following URL in your browser:\n\n%s\n\n", authURL)
+	fmt.Println("After authorizing, your browser will be redirected to localhost:8080.")
+	fmt.Println("That page will fail to load — that's expected on a remote server.")
+	fmt.Println("Copy the full URL from the browser's address bar and paste it below.")
+	fmt.Print("\nRedirect URL: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	rawURL, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading redirect URL: %w", err)
+	}
+	rawURL = strings.TrimSpace(rawURL)
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing redirect URL: %w", err)
+	}
+
+	if errMsg := parsed.Query().Get("error"); errMsg != "" {
+		return "", fmt.Errorf("authorization failed: %s", errMsg)
+	}
+
+	code := parsed.Query().Get("code")
+	if code == "" {
+		return "", fmt.Errorf("no authorization code found in URL — make sure you copied the full redirect URL")
+	}
+
+	return code, nil
 }
 
 func buildGoogleAuthURL(clientID, redirectURI string) string {

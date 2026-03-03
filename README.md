@@ -44,11 +44,14 @@ Token resolution order: `GDOCS_ACCESS_TOKEN` env var → stored config file.
 ### auth
 
 ```bash
-gdocs auth set-token <token>   # Save a token to config
-gdocs auth login               # Browser OAuth flow (persistent)
-gdocs auth status              # Show current auth status
-gdocs auth logout              # Remove saved token
+gdocs auth set-token <token>          # Save a token to config
+gdocs auth login                      # Browser OAuth flow (persistent)
+gdocs auth login --no-browser         # Manual flow for remote/VPS
+gdocs auth status                     # Show current auth status
+gdocs auth logout                     # Remove saved token
 ```
+
+With `--no-browser`: the CLI prints the OAuth URL. Open it in a local browser, authorize, then copy the full redirect URL from the address bar and paste it into the terminal (the page will fail to load — that's expected).
 
 ### doc
 
