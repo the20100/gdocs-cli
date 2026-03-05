@@ -12,21 +12,50 @@ import (
 
 const apiBase = "https://docs.googleapis.com"
 
+// RefreshFunc is called when the access token is expired.
+// It returns the new access token and its Unix expiry timestamp.
+type RefreshFunc func() (newToken string, expiresAt int64, err error)
+
 // Client is an authenticated Google Docs API client.
 type Client struct {
-	token      string
-	httpClient *http.Client
+	token       string
+	tokenExpiry int64
+	refreshFn   RefreshFunc
+	httpClient  *http.Client
 }
 
 // NewClient creates a new Client using an OAuth Bearer token.
-func NewClient(token string) *Client {
+// refreshFn may be nil if no token refresh is needed.
+func NewClient(token string, tokenExpiry int64, refreshFn RefreshFunc) *Client {
 	return &Client{
-		token:      token,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		token:       token,
+		tokenExpiry: tokenExpiry,
+		refreshFn:   refreshFn,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
+// ensureFreshToken refreshes the access token if it expires within 60 seconds.
+func (c *Client) ensureFreshToken() error {
+	if c.refreshFn == nil {
+		return nil
+	}
+	if c.tokenExpiry > 0 && time.Now().Unix() < c.tokenExpiry-60 {
+		return nil
+	}
+	newToken, newExpiry, err := c.refreshFn()
+	if err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+	c.token = newToken
+	c.tokenExpiry = newExpiry
+	return nil
+}
+
 func (c *Client) doRequest(req *http.Request) ([]byte, error) {
+	if err := c.ensureFreshToken(); err != nil {
+		return nil, err
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.token)
 
